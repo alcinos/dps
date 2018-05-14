@@ -60,12 +60,6 @@ def concrete_binary_sample_kl(pre_sigmoid_sample,
     return log_posterior - log_prior
 
 
-def build_xent_loss(predictions, targets):
-    return -(
-        targets * tf.log(predictions) +
-        (1. - targets) * tf.log(1. - predictions))
-
-
 def build_squared_loss(predictions, targets):
     return (predictions - targets)**2
 
@@ -79,9 +73,9 @@ def build_1norm_loss(predictions, targets):
 
 
 loss_builders = {
-    'xent': build_xent_loss,
     'squared': build_squared_loss,
     '1norm': build_1norm_loss,
+    'normal_ll': build_normal_ll_loss,
 }
 
 
@@ -107,8 +101,6 @@ class YoloAir_Network(Parameterized):
     n_backbone_features = Param(100)
     n_passthrough_features = Param(100)
 
-    xent_loss = Param(True)
-
     fixed_values = Param(dict())
     fixed_weights = Param("")
     no_gradient = Param("")
@@ -122,7 +114,7 @@ class YoloAir_Network(Parameterized):
     train_kl = Param(True)
 
     yx_prior_mean = Param(0.0)
-    yx_prior_std = Param(1.0)
+    yx_prior_std = Param(100.0)
 
     hw_prior_mean = Param(0.0)
     hw_prior_std = Param(1.0)
@@ -131,8 +123,6 @@ class YoloAir_Network(Parameterized):
     attr_prior_std = Param(1.0)
 
     obj_logit_scale = Param(2.0)
-    alpha_logit_scale = Param(0.1)
-    alpha_logit_bias = Param(5.0)
 
     sequential_cfg = Param(dict(
         on=False,
@@ -582,31 +572,14 @@ class YoloAir_Network(Parameterized):
 
         # --- Compute sprites from attr using object decoder ---
 
-        object_logits = self.object_decoder(
-            object_decoder_in, self.object_shape + (self.image_depth+1,), self.is_training)
-
-        object_logits = object_logits * ([self.obj_logit_scale] * 3 + [self.alpha_logit_scale])
-        object_logits = object_logits + ([0.] * 3 + [self.alpha_logit_bias])
-
-        objects = tf.nn.sigmoid(tf.clip_by_value(object_logits, -10., 10.))
+        objects = self.object_decoder(
+            object_decoder_in, self.object_shape + (self.image_depth,), self.is_training)
 
         self._tensors["objects"] = tf.reshape(
-            objects, (self.batch_size, self.H, self.W, self.B, *self.object_shape, self.image_depth+1,))
+            objects, (self.batch_size, self.H, self.W, self.B, *self.object_shape, self.image_depth,))
 
-        objects = tf.reshape(objects, (self.batch_size, self.HWB, *self.object_shape, self.image_depth+1,))
-
-        obj_img, obj_alpha = tf.split(objects, [3, 1], axis=-1)
-
-        if "alpha" in self.no_gradient:
-            obj_alpha = tf.stop_gradient(obj_alpha)
-
-        if "alpha" in self.fixed_values:
-            obj_alpha = float(self.fixed_values["alpha"]) * tf.ones_like(obj_alpha)
-
-        obj_alpha *= tf.reshape(self.program['obj'], (self.batch_size, self.HWB, 1, 1, 1))
-        obj_alpha = tf.exp(obj_alpha * 5 + (1-obj_alpha) * -5)  # Inner expression is equivalent to 5 * (2*obj_alpha - 1)
-
-        objects = tf.concat([obj_img, obj_alpha], axis=-1)
+        objects = tf.reshape(objects, (self.batch_size, self.HWB, *self.object_shape, self.image_depth,))
+        objects *= tf.reshape(self.program['obj'], (self.batch_size, self.HWB, 1, 1, 1))
 
         # --- Compose images ---
 
@@ -624,7 +597,7 @@ class YoloAir_Network(Parameterized):
             self._tensors["background"]
         )
 
-        output = tf.clip_by_value(output, 1e-6, 1-1e-6)
+        # output = tf.clip_by_value(output, 1e-6, 1-1e-6)
 
         # --- Store values ---
 
@@ -783,7 +756,7 @@ class YoloAir_Network(Parameterized):
         losses = dict()
 
         if self.train_reconstruction:
-            loss_key = 'xent' if self.xent_loss else 'squared'
+            loss_key = 'normal_ll'
 
             output = self._tensors['output']
             inp = self._tensors['inp']
@@ -812,6 +785,11 @@ class YoloAir_Network(Parameterized):
             "recorded_tensors": recorded_tensors,
             "losses": losses
         }
+
+
+def safe_imshow(ax, image, vmin=0.0, vmax=1.0):
+    image = np.clip(image, 0.0, 1.0)
+    ax.imshow(image, vmin=vmin, vmax=vmax)
 
 
 class YoloAir_RenderHook(object):
@@ -884,7 +862,7 @@ class YoloAir_RenderHook(object):
             j = int(n % sqrt_N)
 
             ax1 = axes[2*i, 2*j]
-            ax1.imshow(gt, vmin=0.0, vmax=1.0)
+            safe_imshow(ax1, gt, vmin=0.0, vmax=1.0)
 
             if prediction is not None:
                 _target = targets[n]
@@ -892,13 +870,13 @@ class YoloAir_RenderHook(object):
                 ax1.set_title("target={}, prediction={}".format(np.argmax(_target), np.argmax(_prediction)))
 
             ax2 = axes[2*i, 2*j+1]
-            ax2.imshow(pred, vmin=0.0, vmax=1.0)
+            safe_imshow(ax2, pred, vmin=0.0, vmax=1.0)
 
             ax3 = axes[2*i+1, 2*j]
-            ax3.imshow(pred, vmin=0.0, vmax=1.0)
+            safe_imshow(ax3, pred, vmin=0.0, vmax=1.0)
 
             ax4 = axes[2*i+1, 2*j+1]
-            ax4.imshow(pred, vmin=0.0, vmax=1.0)
+            safe_imshow(ax4, pred, vmin=0.0, vmax=1.0)
 
             # Plot proposed bounding boxes
             for o, (top, left, height, width) in zip(obj[n], box[n]):
@@ -972,7 +950,7 @@ class YoloAir_RenderHook(object):
                         _obj = obj[idx, h, w, b, 0]
 
                         ax = axes[3*h, w * B + b]
-                        ax.imshow(objects[idx, h, w, b, :, :, :3], vmin=0.0, vmax=1.0)
+                        safe_imshow(ax, objects[idx, h, w, b, :, :, :], vmin=0.0, vmax=1.0)
 
                         colour = _obj * on_colour + (1-_obj) * off_colour
                         obj_rect = patches.Rectangle(
@@ -985,14 +963,12 @@ class YoloAir_RenderHook(object):
                             ax.set_ylabel("h={}".format(h))
 
                         ax = axes[3*h+1, w * B + b]
-                        ax.imshow(objects[idx, h, w, b, :, :, 3], cmap="gray", vmin=0.0, vmax=1.0)
-
-                        ax.set_title("obj={}, b={}".format(_obj, b))
+                        ax.set_aspect('equal')
 
                         ax = axes[3*h+2, w * B + b]
                         ax.set_title("input glimpse")
 
-                        ax.imshow(input_glimpses[idx, h, w, b, :, :, :], vmin=0.0, vmax=1.0)
+                        safe_imshow(ax, input_glimpses[idx, h, w, b, :, :, :], vmin=0.0, vmax=1.0)
 
             plt.subplots_adjust(left=0.02, right=.98, top=.98, bottom=0.02, wspace=0.1, hspace=0.1)
 
@@ -1040,8 +1016,6 @@ config = Config(
     background_cfg=dict(mode="none"),
 
     object_shape=(14, 14),
-
-    xent_loss=True,
 
     postprocessing="random",
     n_samples_per_image=4,
@@ -1110,10 +1084,12 @@ config.update(
         build_next_step=lambda scope: MLP([100, 100], scope=scope),
     ),
 
+    min_yx=-0.5,
+    max_yx=1.5,
     hw_prior_mean=np.log(0.1/0.9),
     hw_prior_std=1.0,
     anchor_boxes=[[48, 48]],
-    count_prior_log_odds="Exp(start=10000.0, end=0.2, decay_rate=0.1, decay_steps=200, log=True)",
+    count_prior_log_odds="Exp(start=1.0, end=0.0125, decay_rate=0.1, decay_steps=200, log=True)",
     # count_prior_log_odds="Exp(start=10000.0, end=0.000000001, decay_rate=0.1, decay_steps=200, log=True)",
     use_concrete_kl=False,
 
@@ -1158,7 +1134,6 @@ big_double_config = config.copy(
     max_chars=2,
     anchor_boxes=[[40, 40]],
     kernel_size=(3, 3),
-    alpha_logit_scale=0.25,
     obj_logit_scale=2.0,
     count_prior_log_odds="Exp(start=10000.0, end=0.2, decay_rate=0.1, decay_steps=200, log=True)",
     hw_prior_std=2.0,
@@ -1180,7 +1155,6 @@ big_config = config.copy(
     min_chars=1,
     max_chars=2,
     anchor_boxes=[[48, 48]],
-    # fixed_values=dict(alpha=1),
     hw_prior_std=10.0,
 
     build_backbone=yolo_rl.NewBackbone,
