@@ -19,6 +19,20 @@ from dps.utils.base import _bool, popleft, Parameterized, Param
 from dps.utils.inspect_checkpoint import get_tensors_from_checkpoint_file  # noqa: F401
 
 
+def rnn_cell_placeholder(state_size, batch_size=None, dtype=tf.float32, name=''):
+    """ Create a collection of placeholders structured according to `state_size` """
+    if isinstance(state_size, int):
+        return tf.placeholder(dtype, (batch_size, state_size), name=name)
+    elif isinstance(state_size, tf.TensorShape):
+        return tf.placeholder(dtype, (batch_size,) + tuple(state_size), name=name)
+    else:
+        ph = [
+            rnn_cell_placeholder(
+                ss, batch_size=batch_size, dtype=dtype, name="{}/{}".format(name, i))
+            for i, ss in enumerate(state_size)]
+        return type(state_size)(*ph)
+
+
 def apply_mask_and_group_at_front(data, mask):
     """ For masking data and converting it into a format suitable for input into an RNN.
         Finds all the elements of data that correspond to "on" elements of the mask,
@@ -1071,13 +1085,18 @@ class FeedforwardCell(ScopedCell):
         The size of the output, passed as the second argument when calling ``output``.
 
     """
-    def __init__(self, ff, output_size, name="feedforward_cell"):
+    def __init__(self, ff, output_size, obs_only=False, name="feedforward_cell"):
         self.ff = ff
         self._output_size = output_size
+        self.obs_only = obs_only
 
         super(FeedforwardCell, self).__init__(name)
 
     def _call(self, inp, state):
+        if self.obs_only:
+            actions, rewards, obs = inp
+            inp = obs
+
         output = self.ff(inp, self._output_size, False)
         return output, tf.zeros((tf.shape(inp)[0], 1))
 

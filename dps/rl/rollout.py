@@ -88,7 +88,7 @@ class RolloutBatch(dict):
 
     @property
     def T(self):
-        return len(self._r)
+        return len(self._obs)
 
     @property
     def batch_size(self):

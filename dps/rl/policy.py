@@ -6,7 +6,7 @@ from dps import cfg
 from dps.rl import AgentHead
 from dps.utils.tf import (
     MLP, FeedforwardCell, CompositeCell, tf_roll,
-    masked_mean, build_scheduled_value
+    masked_mean, build_scheduled_value, rnn_cell_placeholder
 )
 
 
@@ -51,8 +51,8 @@ class Policy(AgentHead):
         assert len(self.action_selection.param_shape) == 1
         return self.action_selection.param_shape[0]
 
-    def __call__(self, obs, controller_state):
-        utils, next_controller_state = self.agent.get_one_step_utils(obs, controller_state, self.name)
+    def __call__(self, inp, controller_state):
+        utils, next_controller_state = self.agent.get_one_step_utils(inp, controller_state, self.name)
         entropy = self.action_selection.entropy(utils, self.exploration)
         samples = self.action_selection.sample(utils, self.exploration)
         log_probs = self.action_selection.log_probs(utils, samples, self.exploration)
@@ -172,31 +172,35 @@ class Policy(AgentHead):
         if not self.act_is_built:
             # Build a subgraph that we carry around with the Policy for implementing the ``act`` method
             self._policy_state = rnn_cell_placeholder(self.agent.controller.state_size, name='policy_state')
+            self._inp_action = tf.placeholder(tf.float32, (None,)+self.action_shape, name='action')
+            self._reward = tf.placeholder(tf.float32, (None, 1), name='reward')
             self._obs = tf.placeholder(tf.float32, (None,)+self.obs_shape, name='obs')
-            (
-                (self._log_probs, self._samples, self._entropy, self._utils),
-                self._next_policy_state
-            ) = self(self._obs, self._policy_state)
+
+            inp = (self._inp_action, self._reward, self._obs)
+            result = self(inp, self._policy_state)
+            (self._log_probs, self._action, self._entropy, self._utils), self._next_policy_state = result
 
             self.act_is_built = True
 
-    def act(self, obs, policy_state, exploration=None):
+    def act(self, inp, reward, obs, policy_state, exploration=None):
         """ Return (actions, next policy state) given an observation and the current policy state. """
         self.maybe_build_mode()
         self.maybe_build_act()
 
         sess = tf.get_default_session()
         feed_dict = flatten_dict_items({self._policy_state: policy_state})
-        feed_dict.update({self._obs: obs})
+
+        inp_action, reward, obs = inp
+        feed_dict.update({self._inp_action: inp_action, self._reward: reward, self._obs: obs})
+
         if exploration is not None:
             feed_dict.update({self.exploration: exploration})
 
-        log_probs, actions, entropy, utils, next_policy_state = sess.run(
-            [self._log_probs, self._samples, self._entropy,
-             self._utils, self._next_policy_state],
+        log_probs, action, entropy, utils, next_policy_state = sess.run(
+            [self._log_probs, self._action, self._entropy, self._utils, self._next_policy_state],
             feed_dict=feed_dict)
 
-        return (log_probs, actions, entropy, utils), next_policy_state
+        return (log_probs, action, entropy, utils), next_policy_state
 
     @property
     def state_size(self):
@@ -217,19 +221,6 @@ class DiscretePolicy(Policy):
             return self.action_selection.log_probs_all(utils, self.exploration)
         else:
             return super(DiscretePolicy, self).generate_signal(key, context, **kwargs)
-
-
-def rnn_cell_placeholder(state_size, batch_size=None, dtype=tf.float32, name=''):
-    if isinstance(state_size, int):
-        return tf.placeholder(dtype, (batch_size, state_size), name=name)
-    elif isinstance(state_size, tf.TensorShape):
-        return tf.placeholder(dtype, (batch_size,) + tuple(state_size), name=name)
-    else:
-        ph = [
-            rnn_cell_placeholder(
-                ss, batch_size=batch_size, dtype=dtype, name="{}/{}".format(name, i))
-            for i, ss in enumerate(state_size)]
-        return type(state_size)(*ph)
 
 
 class ActionSelection(object):

@@ -11,10 +11,10 @@ from gym.spaces import Discrete, Box
 from dps import cfg
 from dps.rl import RolloutBatch
 from dps.utils import Parameterized, gen_seed, Param
+from dps.utils.tf import rnn_cell_placeholder
 
 
 class Env(Parameterized, GymEnv, metaclass=abc.ABCMeta):
-    ta_order = "obs action reward done log_prob entropy util policy_state".split()
     info_shapes = None
     n_rollouts = None
     has_differentiable_loss = False
@@ -86,6 +86,10 @@ class Env(Parameterized, GymEnv, metaclass=abc.ABCMeta):
             self.maybe_build_placeholders()
 
             with tf.name_scope("sampler_" + policy.display_name):
+                do_reset = tf.placeholder(tf.bool, (), name="do_reset")
+
+                first_policy_state = rnn_cell_placeholder(
+                    policy.agent.controller.state_size, name='policy_state_ph')
 
                 if self.info_shapes is None:
                     # Get info shapes by running the env for one step
@@ -102,54 +106,57 @@ class Env(Parameterized, GymEnv, metaclass=abc.ABCMeta):
                         tf.logical_not(tf.reduce_all(done > 0.5))
                     )
 
-                def body(step, done, policy_state, obs, *tas):
-                    (log_prob, action, entropy, util), new_policy_state = policy(obs, policy_state)
-                    new_obs, reward, new_done, *info = self.build_step(action)
+                def body(step, done, policy_state, action, reward, obs, *tas):
+                    (log_prob, new_action, entropy, util), new_policy_state = policy((action, reward, obs), policy_state)
+                    new_obs, new_reward, new_done, *info = self.build_step(new_action)
+                    new_reward = tf.reshape(new_reward, (self.n_rollouts, 1))
                     new_obs = tf.reshape(new_obs, (self.n_rollouts, *self.obs_shape))
-                    reward = tf.reshape(reward, (self.n_rollouts, 1))
                     new_done = tf.reshape(new_done, (self.n_rollouts, 1))
 
                     for _info, (_, shape) in zip(info, sorted(self.info_shapes.items())):
                         _info = tf.reshape(_info, (self.n_rollouts, *shape))
 
-                    values = [obs, action, reward, done, log_prob, entropy, util, policy_state, *info]
+                    values = [new_done, new_policy_state, new_action, new_reward, new_obs, log_prob, entropy, util, *info]
 
                     new_tas = []
                     for ta, val in zip(tas, values):
                         new_ta = ta.write(ta.size(), tf.to_float(val))
                         new_tas.append(new_ta)
 
-                    return (step+1, new_done, new_policy_state, new_obs, *new_tas)
+                    return (step+1, new_done, new_policy_state, new_action, new_reward, new_obs, *new_tas)
 
-                done = tf.fill((self.n_rollouts, 1), 0.0)
-                policy_state = policy.zero_state(self.n_rollouts, tf.float32)
-                obs = self.build_reset()
-                obs = tf.reshape(obs, (self.n_rollouts, *self.obs_shape))
+                first_done = tf.fill((self.n_rollouts, 1), 0.0)
+                first_action = tf.fill((self.n_rollouts, *self.action_shape), 0.0)
+                first_reward = tf.fill((self.n_rollouts, 1), 0.0)
+                first_obs = self.build_reset()
+                first_obs = tf.reshape(first_obs, (self.n_rollouts, *self.obs_shape))
 
-                n_tas = len(self.ta_order) + len(self.info_shapes)
+                ta_order = "done policy_state action reward obs log_prob entropy util".split()
+                n_tas = len(ta_order) + len(self.info_shapes)
+
                 inp = (
-                    [0, done, policy_state, obs] +
+                    [0, first_done, first_policy_state, first_action, first_reward, first_obs] +
                     [tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True) for i in range(n_tas)]
                 )
 
                 # Force build_step to be called in a safe (non-loop) environment for the first time.
-                dummy_action = tf.zeros((self.n_rollouts,) + self.action_shape)
+                dummy_action = tf.zeros((self.n_rollouts, *self.action_shape))
                 self.build_step(dummy_action)
 
-                _, final_done, final_policy_state, final_obs, *tas = tf.while_loop(
-                    cond, body, inp, parallel_iterations=1)
+                _, _, _, _, _, _, *tas = tf.while_loop(cond, body, inp, parallel_iterations=1)
 
-                obs_ta, action_ta, reward_ta, done_ta, log_prob_ta, entropy_ta, util_ta, policy_state_ta, *info_tas = tas
+                done_ta, policy_state_ta, action_ta, reward_ta, obs_ta, log_prob_ta, entropy_ta, util_ta, *info_tas = tas
 
                 rollout = dict(
-                    obs=tf.concat([obs_ta.stack(), final_obs[None, ...]], axis=0),
-                    actions=action_ta.stack(),
-                    rewards=reward_ta.stack(),
-                    done=tf.concat([done_ta.stack()[1:], final_done[None, :, :]], axis=0),
+                    done=done_ta.stack(),
+                    policy_states=policy_state_ta.stack(),
+                    actions=tf.concat([first_action[None, ...], action_ta.stack()], axis=0),
+                    rewards=tf.concat([first_reward[None, ...], reward_ta.stack()], axis=0),
+                    obs=tf.concat([first_obs[None, ...], obs_ta.stack()], axis=0),
+
                     log_probs=log_prob_ta.stack(),
                     entropy=entropy_ta.stack(),
                     utils=util_ta.stack(),
-                    policy_states=tf.concat([policy_state_ta.stack(), final_policy_state[None, ...]], axis=0)
                 )
 
                 assert len(self.info_shapes) == len(info_tas)
@@ -161,7 +168,7 @@ class Env(Parameterized, GymEnv, metaclass=abc.ABCMeta):
 
                 static = dict(exploration=policy.exploration)
 
-            self._samplers[id(policy)] = rollout, static
+            self._samplers[id(policy)] = [do_reset, first_policy_state, rollout, static, None]
             sampler = self._samplers[id(policy)]
 
         return sampler
@@ -169,7 +176,7 @@ class Env(Parameterized, GymEnv, metaclass=abc.ABCMeta):
     def do_rollouts(self, policy, n_rollouts=None, T=None, exploration=None, mode='train'):
 
         # Important to do this first, it can mess with the mode and other things.
-        rollout, static = self.maybe_build_sampler(policy)
+        first_policy_state, rollout, static = self.maybe_build_sampler(policy)
 
         policy.set_mode(mode)
         self.set_mode(mode, n_rollouts)
@@ -206,10 +213,14 @@ class Env(Parameterized, GymEnv, metaclass=abc.ABCMeta):
         t = 0
 
         done = [False]
+        reward = 0.0
+        action = np.zeros(self.action_shape)
+
         while not all(done):
             if T is not None and t >= T:
                 break
-            (log_probs, action, entropy, utils), policy_state = policy.act(obs, policy_state, exploration)
+
+            (log_probs, action, entropy, utils), policy_state = policy.act((action, reward, obs), policy_state, exploration)
             new_obs, reward, done, info = self.step(action)
             rollouts.append(
                 obs, action, reward, done=done, entropy=entropy,

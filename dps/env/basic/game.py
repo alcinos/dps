@@ -703,8 +703,9 @@ class Backbone(ScopedFunction):
 def build_collection_game_controller(output_size, name):
     # ff = MLP([256, 256, 256], scope="collection_game_controller")
     # ff = Backbone(scope="collection_game_controller")
-    ff = RelationNetwork(scope="collection_controller")
-    return FeedforwardCell(ff, output_size, name=name)
+    # ff = RelationNetwork(scope="collection_controller")
+    ff = MLP([100, 100], scope="collection_controller")
+    return FeedforwardCell(ff, output_size, name=name, obs_only=True)
 
 
 def build_policy(env, **kwargs):

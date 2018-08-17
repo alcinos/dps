@@ -87,6 +87,8 @@ class Agent(RLObject):
         self.build_started = True
 
         if key == 'utils':
+            actions = context.get_signal('actions')
+            rewards = context.get_signal('rewards')
             obs = context.get_signal('obs')
             batch_size = context.get_signal('batch_size')
 
@@ -94,7 +96,7 @@ class Agent(RLObject):
             if T is None:
                 initial_state = self.controller.zero_state(batch_size, tf.float32)
                 utils, _ = dynamic_rnn(
-                    self.controller, obs, initial_state=initial_state,
+                    self.controller, (actions, rewards, obs), initial_state=initial_state,
                     parallel_iterations=1, swap_memory=False, time_major=True)
             else:
                 # If we know T at graph creation time, we can run the controller
@@ -106,7 +108,8 @@ class Agent(RLObject):
 
                 utils = []
                 for t in range(T):
-                    u, state = self.controller(obs[t, ...], state)
+                    inp = actions[t, ...], rewards[t, ...], obs[t, ...]
+                    u, state = self.controller(inp, state)
                     utils.append(u)
                 utils = tf.stack(utils)
 
@@ -132,9 +135,9 @@ class Agent(RLObject):
         start, end = self._head_offsets[head_name]
         return utils[..., start:end]
 
-    def get_one_step_utils(self, obs, controller_state, head_name):
+    def get_one_step_utils(self, inp, controller_state, head_name):
         self.build_started = True
-        utils, next_controller_state = self.controller(obs, controller_state)
+        utils, next_controller_state = self.controller(inp, controller_state)
         start, end = self._head_offsets[head_name]
         return utils[..., start:end], next_controller_state
 
